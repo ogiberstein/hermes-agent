@@ -183,7 +183,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None)
     elif platform == Platform.DISCORD:
         return await _send_discord(pconfig.token, chat_id, message)
     elif platform == Platform.SLACK:
-        return await _send_slack(pconfig.token, chat_id, message)
+        return await _send_slack(pconfig.token, chat_id, message, thread_id=thread_id)
     elif platform == Platform.SIGNAL:
         return await _send_signal(pconfig.extra, chat_id, message)
     elif platform == Platform.EMAIL:
@@ -231,7 +231,7 @@ async def _send_discord(token, chat_id, message):
         return {"error": f"Discord send failed: {e}"}
 
 
-async def _send_slack(token, chat_id, message):
+async def _send_slack(token, chat_id, message, thread_id=None):
     """Send via Slack Web API."""
     try:
         import aiohttp
@@ -240,8 +240,11 @@ async def _send_slack(token, chat_id, message):
     try:
         url = "https://slack.com/api/chat.postMessage"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload = {"channel": chat_id, "text": message}
+        if thread_id is not None:
+            payload["thread_ts"] = thread_id
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json={"channel": chat_id, "text": message}) as resp:
+            async with session.post(url, headers=headers, json=payload) as resp:
                 data = await resp.json()
                 if data.get("ok"):
                     return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
