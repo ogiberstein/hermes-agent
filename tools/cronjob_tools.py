@@ -124,6 +124,9 @@ def schedule_cronjob(
             "chat_id": origin_chat_id,
             "chat_name": os.getenv("HERMES_SESSION_CHAT_NAME"),
         }
+        origin_thread_id = os.getenv("HERMES_SESSION_THREAD_ID")
+        if origin_thread_id:
+            origin["thread_id"] = origin_thread_id
     
     try:
         job = create_job(

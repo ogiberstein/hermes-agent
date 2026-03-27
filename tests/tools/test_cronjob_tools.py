@@ -117,6 +117,29 @@ class TestScheduleCronjob:
         ))
         assert result["repeat"] == "5 times"
 
+    def test_origin_preserves_thread_id_from_environment(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "slack")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "C123")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_NAME", "trading-strategy")
+        monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "1774555596.462009")
+
+        result = json.loads(schedule_cronjob(
+            prompt="Check server status",
+            schedule="30m",
+            name="Threaded Job",
+        ))
+        assert result["success"] is True
+
+        listing = json.loads(list_cronjobs(include_disabled=True))
+        job = next(j for j in listing["jobs"] if j["job_id"] == result["job_id"])
+        assert job["deliver"] == "origin"
+
+        from cron.jobs import load_jobs
+        stored_job = next(j for j in load_jobs() if j["id"] == result["job_id"])
+        assert stored_job["origin"]["platform"] == "slack"
+        assert stored_job["origin"]["chat_id"] == "C123"
+        assert stored_job["origin"]["thread_id"] == "1774555596.462009"
+
 
 # =========================================================================
 # list_cronjobs
