@@ -5027,6 +5027,18 @@ class AIAgent:
                 "Fallback activated: %s → %s (%s)",
                 old_model, fb_model, fb_provider,
             )
+            try:
+                from hermes_cli.fallback_alerts import notify_fallback_activation
+                notify_fallback_activation(
+                    primary_provider=str(self._primary_runtime.get("provider") or "auto"),
+                    primary_model=str(self._primary_runtime.get("model") or old_model or ""),
+                    fallback_provider=fb_provider,
+                    fallback_model=fb_model,
+                    reason="runtime_failure",
+                    scope="agent_retry_loop",
+                )
+            except Exception:
+                logging.debug("Failed to dispatch runtime fallback alert", exc_info=True)
             return True
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
@@ -5093,6 +5105,15 @@ class AIAgent:
                 "Primary runtime restored for new turn: %s (%s)",
                 self.model, self.provider,
             )
+            try:
+                from hermes_cli.fallback_alerts import notify_primary_restored
+                notify_primary_restored(
+                    primary_provider=str(self.provider or rt.get("provider") or "auto"),
+                    primary_model=str(self.model or rt.get("model") or ""),
+                    scope="agent_turn_restore",
+                )
+            except Exception:
+                logging.debug("Failed to dispatch primary-restored alert", exc_info=True)
             return True
         except Exception as e:
             logging.warning("Failed to restore primary runtime: %s", e)
@@ -7364,9 +7385,6 @@ class AIAgent:
             max_retries = 3
             primary_recovery_attempted = False
             max_compression_attempts = 3
-            codex_auth_retry_attempted=False
-            anthropic_auth_retry_attempted=False
-            nous_auth_retry_attempted=False
             has_retried_429 = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
@@ -7901,52 +7919,8 @@ class AIAgent:
                     )
                     if recovered_with_pool:
                         continue
-                    if (
-                        self.api_mode == "codex_responses"
-                        and self.provider == "openai-codex"
-                        and status_code == 401
-                        and not codex_auth_retry_attempted
-                    ):
-                        codex_auth_retry_attempted = True
-                        if self._try_refresh_codex_client_credentials(force=True):
-                            self._vprint(f"{self.log_prefix}🔐 Codex auth refreshed after 401. Retrying request...")
-                            continue
-                    if (
-                        self.api_mode == "chat_completions"
-                        and self.provider == "nous"
-                        and status_code == 401
-                        and not nous_auth_retry_attempted
-                    ):
-                        nous_auth_retry_attempted = True
-                        if self._try_refresh_nous_client_credentials(force=True):
-                            print(f"{self.log_prefix}🔐 Nous agent key refreshed after 401. Retrying request...")
-                            continue
-                    if (
-                        self.api_mode == "anthropic_messages"
-                        and status_code == 401
-                        and hasattr(self, '_anthropic_api_key')
-                        and not anthropic_auth_retry_attempted
-                    ):
-                        anthropic_auth_retry_attempted = True
-                        from agent.anthropic_adapter import _is_oauth_token
-                        if self._try_refresh_anthropic_client_credentials():
-                            print(f"{self.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
-                            continue
-                        # Credential refresh didn't help — show diagnostic info
-                        key = self._anthropic_api_key
-                        auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
-                        print(f"{self.log_prefix}🔐 Anthropic 401 — authentication failed.")
-                        print(f"{self.log_prefix}   Auth method: {auth_method}")
-                        print(f"{self.log_prefix}   Token prefix: {key[:12]}..." if key and len(key) > 12 else f"{self.log_prefix}   Token: (empty or short)")
-                        print(f"{self.log_prefix}   Troubleshooting:")
-                        from hermes_constants import display_hermes_home as _dhh_fn
-                        _dhh = _dhh_fn()
-                        print(f"{self.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
-                        print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
-                        print(f"{self.log_prefix}     • For API keys: verify at https://console.anthropic.com/settings/keys")
-                        print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
-                        print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_TOKEN \"\"")
-                        print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_API_KEY \"\"")
+                    if status_code == 401:
+                        self._emit_status("⚠️ Authentication failed — switching to fallback or requiring re-auth.")
 
                     retry_count += 1
                     elapsed_time = time.time() - api_start_time

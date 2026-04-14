@@ -766,3 +766,67 @@ def format_runtime_provider_error(error: Exception) -> str:
     if isinstance(error, AuthError):
         return format_auth_error(error)
     return str(error)
+
+
+def normalize_fallback_chain(fallback_model: Any) -> list[dict[str, Any]]:
+    if isinstance(fallback_model, list):
+        return [
+            entry for entry in fallback_model
+            if isinstance(entry, dict) and entry.get("provider") and entry.get("model")
+        ]
+    if isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+        return [fallback_model]
+    return []
+
+
+def resolve_runtime_provider_with_auth_fallback(
+    *,
+    requested: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    fallback_model: Any = None,
+) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+    """Resolve runtime credentials, fast-failing auth to configured fallback.
+
+    Returns ``(runtime, selected_fallback)`` where ``selected_fallback`` is the
+    fallback config dict that was activated, or ``None`` when the primary
+    runtime resolved successfully.
+    """
+    try:
+        runtime = resolve_runtime_provider(
+            requested=requested,
+            explicit_base_url=explicit_base_url,
+        )
+        return runtime, None
+    except AuthError as primary_exc:
+        fallback_chain = normalize_fallback_chain(fallback_model)
+        for fallback in fallback_chain:
+            fallback_provider = str(fallback.get("provider") or "").strip()
+            if not fallback_provider:
+                continue
+            try:
+                runtime = resolve_runtime_provider(
+                    requested=fallback_provider,
+                    explicit_base_url=(fallback.get("base_url") or "") or None,
+                )
+                try:
+                    from hermes_cli.fallback_alerts import notify_fallback_activation
+                    notify_fallback_activation(
+                        primary_provider=str(requested or runtime.get("requested_provider") or "auto"),
+                        primary_model="",
+                        fallback_provider=fallback_provider,
+                        fallback_model=str(fallback.get("model") or ""),
+                        reason="auth_failure",
+                        scope="runtime_resolution",
+                    )
+                except Exception:
+                    logger.debug("Failed to dispatch auth-fallback alert", exc_info=True)
+                return runtime, fallback
+            except AuthError as fallback_exc:
+                logger.warning(
+                    "Fallback runtime auth failed for provider %s after primary auth failure on %s: %s",
+                    fallback_provider,
+                    requested or "auto",
+                    fallback_exc,
+                )
+                continue
+        raise primary_exc

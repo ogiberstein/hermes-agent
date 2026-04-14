@@ -83,9 +83,12 @@ class TestTryActivateFallback:
             api_key="sk-or-fallback-key",
             base_url="https://openrouter.ai/api/v1",
         )
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(mock_client, "anthropic/claude-sonnet-4"),
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(mock_client, "anthropic/claude-sonnet-4"),
+            ),
+            patch("hermes_cli.fallback_alerts.notify_fallback_activation") as mock_notify,
         ):
             result = agent._try_activate_fallback()
             assert result is True
@@ -94,6 +97,7 @@ class TestTryActivateFallback:
             assert agent.provider == "openrouter"
             assert agent.api_mode == "chat_completions"
             assert agent.client is mock_client
+            mock_notify.assert_called_once()
 
     def test_activates_zai_fallback(self):
         agent = _make_agent(

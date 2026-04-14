@@ -136,3 +136,64 @@ def test_check_gateway_service_linger_skips_when_service_not_installed(monkeypat
     out = capsys.readouterr().out
     assert out == ""
     assert issues == []
+
+
+def test_run_doctor_reports_runtime_resilience_section(monkeypatch, tmp_path, capsys):
+    project_root = tmp_path / "project"
+    hermes_home = tmp_path / ".hermes"
+    project_root.mkdir()
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text("OPENROUTER_API_KEY=test\n", encoding="utf-8")
+    (hermes_home / "config.yaml").write_text(
+        "model:\n  default: gpt-5.4\n  provider: openai-codex\n"
+        "fallback_model:\n  provider: openrouter\n  model: anthropic/claude-sonnet-4.6\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr("hermes_cli.auth.get_nous_auth_status", lambda: {"logged_in": False})
+    monkeypatch.setattr("hermes_cli.auth.get_codex_auth_status", lambda: {"logged_in": True})
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/fake" if name in {"git", "python", "node", "npm", "codex"} else None)
+    monkeypatch.setattr(
+        "httpx.get",
+        lambda *args, **kwargs: SimpleNamespace(status_code=200),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.fallback_alerts.get_fallback_alert_status",
+        lambda: {
+            "active": None,
+            "cooldown_seconds": 900,
+            "slack_channel": "C123",
+            "slack_configured": "yes",
+            "whatsapp_chat_id": "29012621545538@lid",
+            "whatsapp_configured": "yes",
+        },
+    )
+    monkeypatch.setattr(
+        doctor_mod,
+        "_latest_backup_status",
+        lambda: {
+            "repo_present": True,
+            "manifest_status": "success",
+            "manifest_timestamp": "2026-04-14T08:06:58Z",
+            "service_active": "inactive",
+            "timer_active": "active",
+            "next_trigger": "Wed 2026-04-15 03:00:00 UTC",
+        },
+    )
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    doctor_mod.run_doctor(Namespace(fix=False))
+    out = capsys.readouterr().out
+    assert "◆ Runtime Resilience" in out
+    assert "Primary runtime" in out
+    assert "Fallback runtime" in out
+    assert "Fallback Slack alerts" in out
+    assert "Fallback WhatsApp alerts" in out
+    assert "Latest backup run" in out

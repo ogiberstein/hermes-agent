@@ -386,9 +386,9 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
-def test_run_conversation_codex_refreshes_after_401_and_retries(monkeypatch):
+def test_run_conversation_codex_401_uses_fallback_without_refresh(monkeypatch):
     agent = _build_agent(monkeypatch)
-    calls = {"api": 0, "refresh": 0}
+    calls = {"api": 0, "fallback": 0}
 
     class _UnauthorizedError(RuntimeError):
         def __init__(self):
@@ -399,22 +399,28 @@ def test_run_conversation_codex_refreshes_after_401_and_retries(monkeypatch):
         calls["api"] += 1
         if calls["api"] == 1:
             raise _UnauthorizedError()
-        return _codex_message_response("Recovered after refresh")
+        return _codex_message_response("Recovered via fallback")
 
-    def _fake_refresh(*, force=True):
-        calls["refresh"] += 1
-        assert force is True
+    def _fake_activate_fallback():
+        calls["fallback"] += 1
+        agent.provider = "openrouter"
+        agent.model = "anthropic/claude-sonnet-4.6"
         return True
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
-    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _fake_refresh)
+    monkeypatch.setattr(
+        agent,
+        "_try_refresh_codex_client_credentials",
+        lambda *, force=True: (_ for _ in ()).throw(AssertionError("auth refresh retry should not run")),
+    )
+    monkeypatch.setattr(agent, "_try_activate_fallback", _fake_activate_fallback)
 
     result = agent.run_conversation("Say OK")
 
     assert calls["api"] == 2
-    assert calls["refresh"] == 1
+    assert calls["fallback"] == 1
     assert result["completed"] is True
-    assert result["final_response"] == "Recovered after refresh"
+    assert result["final_response"] == "Recovered via fallback"
 
 
 def test_try_refresh_codex_client_credentials_rebuilds_client(monkeypatch):

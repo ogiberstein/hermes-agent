@@ -288,20 +288,7 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
-    """Resolve provider credentials for gateway-created AIAgent instances."""
-    from hermes_cli.runtime_provider import (
-        resolve_runtime_provider,
-        format_runtime_provider_error,
-    )
-
-    try:
-        runtime = resolve_runtime_provider(
-            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
-        )
-    except Exception as exc:
-        raise RuntimeError(format_runtime_provider_error(exc)) from exc
-
+def _runtime_kwargs_from_resolved_runtime(runtime: dict) -> dict:
     return {
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
@@ -311,6 +298,52 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
     }
+
+
+def _resolve_runtime_agent_config(
+    *,
+    model: str,
+    fallback_model: list | dict | None = None,
+    requested_provider: str | None = None,
+) -> tuple[dict, str]:
+    """Resolve provider credentials and effective model for gateway-created agents."""
+    from hermes_cli.runtime_provider import (
+        resolve_runtime_provider_with_auth_fallback,
+        format_runtime_provider_error,
+    )
+
+    try:
+        runtime, selected_fallback = resolve_runtime_provider_with_auth_fallback(
+            requested=requested_provider or os.getenv("HERMES_INFERENCE_PROVIDER"),
+            fallback_model=fallback_model,
+        )
+    except Exception as exc:
+        raise RuntimeError(format_runtime_provider_error(exc)) from exc
+
+    resolved_model = model
+    if selected_fallback and selected_fallback.get("model"):
+        resolved_model = str(selected_fallback.get("model") or model)
+    else:
+        try:
+            from hermes_cli.fallback_alerts import notify_primary_restored
+            notify_primary_restored(
+                primary_provider=str(runtime.get("provider") or requested_provider or "auto"),
+                primary_model=str(model or ""),
+                scope="gateway_runtime_resolution",
+            )
+        except Exception:
+            logger.debug("Failed to dispatch primary-restored alert", exc_info=True)
+
+    return _runtime_kwargs_from_resolved_runtime(runtime), resolved_model
+
+
+def _resolve_runtime_agent_kwargs() -> dict:
+    """Resolve provider credentials for gateway-created AIAgent instances."""
+    runtime_kwargs, _ = _resolve_runtime_agent_config(
+        model="",
+        fallback_model=GatewayRunner._load_fallback_model(),
+    )
+    return runtime_kwargs
 
 
 def _build_media_placeholder(event) -> str:
@@ -484,6 +517,7 @@ class GatewayRunner:
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
         self._smart_model_routing = self._load_smart_model_routing()
+        self._runtime_config_state = None
 
         # Wire process registry into session store for reset protection
         from tools.process_registry import process_registry
@@ -1044,6 +1078,31 @@ class GatewayRunner:
         except Exception:
             pass
         return {}
+
+    def _reload_runtime_config_if_needed(self, force: bool = False) -> bool:
+        """Hot-reload gateway runtime config from ~/.hermes/config.yaml when it changes."""
+        cfg_path = _hermes_home / "config.yaml"
+        try:
+            stat = cfg_path.stat()
+            state = (stat.st_mtime_ns, stat.st_size)
+        except FileNotFoundError:
+            state = None
+        except Exception:
+            logger.debug("Failed to stat runtime config for reload", exc_info=True)
+            return False
+
+        if not force and getattr(self, "_runtime_config_state", None) == state:
+            return False
+
+        self._prefill_messages = self._load_prefill_messages()
+        self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
+        self._reasoning_config = self._load_reasoning_config()
+        self._show_reasoning = self._load_show_reasoning()
+        self._provider_routing = self._load_provider_routing()
+        self._fallback_model = self._load_fallback_model()
+        self._smart_model_routing = self._load_smart_model_routing()
+        self._runtime_config_state = state
+        return True
 
     async def start(self) -> bool:
         """
@@ -6173,6 +6232,7 @@ class GatewayRunner:
         runtime: dict,
         enabled_toolsets: list,
         ephemeral_prompt: str,
+        runtime_config: dict | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -6201,6 +6261,7 @@ class GatewayRunner:
                 # reasoning_config excluded — it's set per-message on the
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
+                runtime_config or {},
             ],
             sort_keys=True,
             default=str,
@@ -6240,6 +6301,7 @@ class GatewayRunner:
         from run_agent import AIAgent
         import queue
         
+        self._reload_runtime_config_if_needed()
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
@@ -6550,7 +6612,10 @@ class GatewayRunner:
             model = _resolve_gateway_model(user_config)
 
             try:
-                runtime_kwargs = _resolve_runtime_agent_kwargs()
+                runtime_kwargs, model = _resolve_runtime_agent_config(
+                    model=model,
+                    fallback_model=self._fallback_model,
+                )
             except Exception as exc:
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
@@ -6601,6 +6666,11 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
+                {
+                    "fallback_model": getattr(self, "_fallback_model", None),
+                    "smart_model_routing": getattr(self, "_smart_model_routing", {}),
+                    "provider_routing": getattr(self, "_provider_routing", {}),
+                },
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)

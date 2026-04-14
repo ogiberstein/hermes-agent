@@ -562,9 +562,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Provider routing
         pr = _cfg.get("provider_routing", {})
         smart_routing = _cfg.get("smart_model_routing", {}) or {}
+        fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
 
         from hermes_cli.runtime_provider import (
-            resolve_runtime_provider,
+            resolve_runtime_provider_with_auth_fallback,
             format_runtime_provider_error,
         )
         try:
@@ -573,10 +574,26 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
-            runtime = resolve_runtime_provider(**runtime_kwargs)
+            runtime, selected_fallback = resolve_runtime_provider_with_auth_fallback(
+                **runtime_kwargs,
+                fallback_model=fallback_model,
+            )
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
+
+        if selected_fallback and selected_fallback.get("model"):
+            model = str(selected_fallback.get("model") or model)
+        else:
+            try:
+                from hermes_cli.fallback_alerts import notify_primary_restored
+                notify_primary_restored(
+                    primary_provider=str(runtime.get("provider") or runtime_kwargs.get("requested") or "auto"),
+                    primary_model=str(model or ""),
+                    scope="cron_runtime_resolution",
+                )
+            except Exception:
+                logger.debug("Failed to dispatch primary-restored alert for cron", exc_info=True)
 
         from agent.smart_model_routing import resolve_turn_route
         turn_route = resolve_turn_route(
@@ -614,6 +631,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            fallback_model=fallback_model,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run

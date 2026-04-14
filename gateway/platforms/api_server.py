@@ -416,21 +416,47 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway platforms), falling back to the hermes-api-server default.
         """
         from run_agent import AIAgent
-        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
+        from gateway.run import _resolve_gateway_model, _load_gateway_config
+        from hermes_cli.runtime_provider import (
+            resolve_runtime_provider_with_auth_fallback,
+            format_runtime_provider_error,
+        )
         from hermes_cli.tools_config import _get_platform_tools
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
-
         user_config = _load_gateway_config()
+        model = _resolve_gateway_model(user_config)
+        fallback_model = user_config.get("fallback_providers") or user_config.get("fallback_model") or None
+        try:
+            runtime, selected_fallback = resolve_runtime_provider_with_auth_fallback(
+                requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+                fallback_model=fallback_model,
+            )
+        except Exception as exc:
+            raise RuntimeError(format_runtime_provider_error(exc)) from exc
+        runtime_kwargs = {
+            "api_key": runtime.get("api_key"),
+            "base_url": runtime.get("base_url"),
+            "provider": runtime.get("provider"),
+            "api_mode": runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+        }
+        if selected_fallback and selected_fallback.get("model"):
+            model = str(selected_fallback.get("model") or model)
+        else:
+            try:
+                from hermes_cli.fallback_alerts import notify_primary_restored
+                notify_primary_restored(
+                    primary_provider=str(runtime.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER") or "auto"),
+                    primary_model=str(model or ""),
+                    scope="api_server_runtime_resolution",
+                )
+            except Exception:
+                logger.debug("Failed to dispatch primary-restored alert for api_server", exc_info=True)
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-
-        # Load fallback provider chain so the API server platform has the
-        # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        from gateway.run import GatewayRunner
-        fallback_model = GatewayRunner._load_fallback_model()
 
         agent = AIAgent(
             model=model,

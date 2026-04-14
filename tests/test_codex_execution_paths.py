@@ -1,7 +1,8 @@
 import asyncio
 import sys
 import types
-from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
@@ -13,136 +14,133 @@ import gateway.run as gateway_run
 import run_agent
 from gateway.config import Platform
 from gateway.session import SessionSource
+from hermes_cli.auth import AuthError
+from hermes_cli.runtime_provider import resolve_runtime_provider_with_auth_fallback
 
 
-def _patch_agent_bootstrap(monkeypatch):
-    monkeypatch.setattr(
-        run_agent,
-        "get_tool_definitions",
-        lambda **kwargs: [
-            {
-                "type": "function",
-                "function": {
-                    "name": "terminal",
-                    "description": "Run shell commands.",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ],
-    )
-    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
-
-
-def _codex_message_response(text: str):
-    return SimpleNamespace(
-        output=[
-            SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(type="output_text", text=text)],
-            )
-        ],
-        usage=SimpleNamespace(input_tokens=5, output_tokens=3, total_tokens=8),
-        status="completed",
-        model="gpt-5-codex",
+def _write_runtime_config(config_path: Path) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        """
+model:
+  default: gpt-5.4
+  provider: openai-codex
+fallback_model:
+  provider: openrouter
+  model: anthropic/claude-sonnet-4.6
+smart_model_routing:
+  enabled: false
+""".strip()
+        + "\n",
+        encoding="utf-8",
     )
 
 
-class _UnauthorizedError(RuntimeError):
-    def __init__(self):
-        super().__init__("Error code: 401 - unauthorized")
-        self.status_code = 401
-
-
-class _FakeOpenAI:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-
-    def close(self):
-        return None
-
-
-class _Codex401ThenSuccessAgent(run_agent.AIAgent):
-    refresh_attempts = 0
+class _RecordingAgent:
     last_init = {}
 
     def __init__(self, *args, **kwargs):
-        kwargs.setdefault("skip_context_files", True)
-        kwargs.setdefault("skip_memory", True)
-        kwargs.setdefault("max_iterations", 4)
         type(self).last_init = dict(kwargs)
-        super().__init__(*args, **kwargs)
-        self._cleanup_task_resources = lambda task_id: None
-        self._persist_session = lambda messages, history=None: None
-        self._save_trajectory = lambda messages, user_message, completed: None
-        self._save_session_log = lambda messages: None
 
-    def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
-        type(self).refresh_attempts += 1
-        return True
-
-    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
-        calls = {"api": 0}
-
-        def _fake_api_call(api_kwargs):
-            calls["api"] += 1
-            if calls["api"] == 1:
-                raise _UnauthorizedError()
-            return _codex_message_response("Recovered via refresh")
-
-        self._interruptible_api_call = _fake_api_call
-        return super().run_conversation(user_message, conversation_history=conversation_history, task_id=task_id)
+    def run_conversation(self, user_message, conversation_history=None, task_id=None):
+        provider = type(self).last_init.get("provider")
+        model = type(self).last_init.get("model")
+        return {
+            "completed": True,
+            "final_response": f"{provider}:{model}",
+            "messages": [],
+            "tools": [],
+        }
 
 
-def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
-    _patch_agent_bootstrap(monkeypatch)
-    monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
-    monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
+def _runtime_resolver_with_primary_auth_failure(*, requested=None, explicit_base_url=None):
+    if requested in (None, "openai-codex"):
+        raise AuthError(
+            "Codex token refresh failed with status 401.",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+    if requested == "openrouter":
+        return {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "or-key",
+        }
+    raise AssertionError(f"unexpected provider request: {requested}")
+
+
+def test_cron_run_job_auth_failure_uses_fallback_runtime(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes"
+    _write_runtime_config(hermes_home / "config.yaml")
+
+    monkeypatch.setattr(cron_scheduler, "_hermes_home", hermes_home)
+    monkeypatch.setattr(run_agent, "AIAgent", _RecordingAgent)
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested=None: {
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "codex-token",
-        },
+        _runtime_resolver_with_primary_auth_failure,
     )
     monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
 
-    _Codex401ThenSuccessAgent.refresh_attempts = 0
-    _Codex401ThenSuccessAgent.last_init = {}
+    _RecordingAgent.last_init = {}
 
     success, output, final_response, error = cron_scheduler.run_job(
-        {"id": "job-1", "name": "Codex Refresh Test", "prompt": "ping", "model": "gpt-5.3-codex"}
+        {"id": "job-1", "name": "Codex Auth Failover", "prompt": "ping", "model": "gpt-5.4"}
     )
 
     assert success is True
     assert error is None
-    assert final_response == "Recovered via refresh"
-    assert "Recovered via refresh" in output
-    assert _Codex401ThenSuccessAgent.refresh_attempts == 1
-    assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
-    assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+    assert final_response == "openrouter:anthropic/claude-sonnet-4.6"
+    assert "openrouter:anthropic/claude-sonnet-4.6" in output
+    assert _RecordingAgent.last_init["provider"] == "openrouter"
+    assert _RecordingAgent.last_init["model"] == "anthropic/claude-sonnet-4.6"
 
 
-def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
-    _patch_agent_bootstrap(monkeypatch)
-    monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
-    monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
+def test_runtime_resolution_auth_failure_uses_fallback_runtime(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes"
+    _write_runtime_config(hermes_home / "config.yaml")
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
     monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs",
-        lambda: {
-            "provider": "openai-codex",
-            "api_mode": "codex_responses",
-            "base_url": "https://chatgpt.com/backend-api/codex",
-            "api_key": "codex-token",
-        },
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _runtime_resolver_with_primary_auth_failure,
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    alert_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.fallback_alerts.notify_fallback_activation",
+        lambda **kwargs: alert_calls.append(kwargs),
     )
     monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
-    monkeypatch.setenv("HERMES_MODEL", "gpt-5.3-codex")
 
-    _Codex401ThenSuccessAgent.refresh_attempts = 0
-    _Codex401ThenSuccessAgent.last_init = {}
+    runtime, fallback = resolve_runtime_provider_with_auth_fallback(
+        requested="openai-codex",
+        fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
+    )
+
+    assert runtime["provider"] == "openrouter"
+    assert runtime["api_key"] == "or-key"
+    assert fallback == {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"}
+    assert len(alert_calls) == 1
+    assert alert_calls[0]["fallback_provider"] == "openrouter"
+    assert alert_calls[0]["reason"] == "auth_failure"
+
+
+def test_gateway_run_agent_auth_failure_uses_fallback_runtime(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes"
+    _write_runtime_config(hermes_home / "config.yaml")
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(run_agent, "AIAgent", _RecordingAgent)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _runtime_resolver_with_primary_auth_failure,
+    )
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
+
+    _RecordingAgent.last_init = {}
 
     runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
     runner.adapters = {}
@@ -150,9 +148,8 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._provider_routing = {}
-    runner._fallback_model = None
+    runner._fallback_model = {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"}
     runner._running_agents = {}
-    from unittest.mock import MagicMock, AsyncMock
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.hooks.loaded_hooks = []
@@ -163,21 +160,20 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
         chat_id="cli",
         chat_name="CLI",
         chat_type="dm",
-        user_id="user-1",
+        user_id="test-user-1",
     )
 
     result = asyncio.run(
         runner._run_agent(
-            message="ping",
+            message="hello",
             context_prompt="",
             history=[],
             source=source,
-            session_id="session-1",
+            session_id="session-401",
             session_key="agent:main:local:dm",
         )
     )
 
-    assert result["final_response"] == "Recovered via refresh"
-    assert _Codex401ThenSuccessAgent.refresh_attempts == 1
-    assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
-    assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
+    assert result["final_response"] == "openrouter:anthropic/claude-sonnet-4.6"
+    assert _RecordingAgent.last_init["provider"] == "openrouter"
+    assert _RecordingAgent.last_init["model"] == "anthropic/claude-sonnet-4.6"

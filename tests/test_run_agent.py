@@ -1610,12 +1610,12 @@ class TestRunConversation:
         assert result["final_response"] == "(empty)"
         assert result["api_calls"] == 1  # no retries
 
-    def test_nous_401_refreshes_after_remint_and_retries(self, agent):
+    def test_nous_401_uses_fallback_without_refresh(self, agent):
         self._setup_agent(agent)
         agent.provider = "nous"
         agent.api_mode = "chat_completions"
 
-        calls = {"api": 0, "refresh": 0}
+        calls = {"api": 0, "fallback": 0}
 
         class _UnauthorizedError(RuntimeError):
             def __init__(self):
@@ -1627,12 +1627,13 @@ class TestRunConversation:
             if calls["api"] == 1:
                 raise _UnauthorizedError()
             return _mock_response(
-                content="Recovered after remint", finish_reason="stop"
+                content="Recovered via fallback", finish_reason="stop"
             )
 
-        def _fake_refresh(*, force=True):
-            calls["refresh"] += 1
-            assert force is True
+        def _fake_activate_fallback():
+            calls["fallback"] += 1
+            agent.provider = "openrouter"
+            agent.model = "anthropic/claude-sonnet-4.6"
             return True
 
         with (
@@ -1641,15 +1642,18 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
             patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
             patch.object(
-                agent, "_try_refresh_nous_client_credentials", side_effect=_fake_refresh
+                agent,
+                "_try_refresh_nous_client_credentials",
+                side_effect=AssertionError("auth refresh retry should not run"),
             ),
+            patch.object(agent, "_try_activate_fallback", side_effect=_fake_activate_fallback),
         ):
             result = agent.run_conversation("hello")
 
         assert calls["api"] == 2
-        assert calls["refresh"] == 1
+        assert calls["fallback"] == 1
         assert result["completed"] is True
-        assert result["final_response"] == "Recovered after remint"
+        assert result["final_response"] == "Recovered via fallback"
 
     def test_context_compression_triggered(self, agent):
         """When compressor says should_compress, compression runs."""

@@ -91,12 +91,33 @@ class TestAgentConfigSignature:
         """Reasoning config is set per-message, not part of the signature."""
         from gateway.run import GatewayRunner
 
-        runtime = {"api_key": "sk-test12345678", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
+        runtime = {"api_key": "***", "base_url": "https://openrouter.ai/api/v1", "provider": "openrouter"}
         # Same config — signature should be identical regardless of what
         # reasoning_config the caller might have (it's not passed in)
         sig1 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
         sig2 = GatewayRunner._agent_config_signature("claude-sonnet-4", runtime, ["hermes-telegram"], "")
         assert sig1 == sig2
+
+    def test_fallback_change_different_signature(self):
+        """Fallback chain changes must evict cached agents using stale config."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "***", "base_url": "https://chatgpt.com/backend-api/codex", "provider": "openai-codex"}
+        sig1 = GatewayRunner._agent_config_signature(
+            "gpt-5.4",
+            runtime,
+            ["hermes-slack"],
+            "",
+            {"fallback_model": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"}},
+        )
+        sig2 = GatewayRunner._agent_config_signature(
+            "gpt-5.4",
+            runtime,
+            ["hermes-slack"],
+            "",
+            {"fallback_model": {"provider": "openrouter", "model": "google/gemini-2.5-pro"}},
+        )
+        assert sig1 != sig2
 
 
 class TestAgentCacheLifecycle:

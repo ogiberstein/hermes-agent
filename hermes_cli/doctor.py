@@ -8,6 +8,7 @@ import os
 import sys
 import subprocess
 import shutil
+from pathlib import Path
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_constants import display_hermes_home
@@ -121,15 +122,61 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
     print()
     print(color("◆ Gateway Service", Colors.CYAN, Colors.BOLD))
 
-    linger_enabled, linger_detail = get_systemd_linger_status()
-    if linger_enabled is True:
-        check_ok("Systemd linger enabled", "(gateway service survives logout)")
-    elif linger_enabled is False:
-        check_warn("Systemd linger disabled", "(gateway may stop after logout)")
+    check_ok(f"Systemd unit present ({unit_path})")
+
+    enabled, detail = get_systemd_linger_status()
+    if enabled:
+        check_ok("Systemd linger enabled", detail)
+    else:
+        check_warn("Systemd linger disabled", detail or "gateway user service may stop after logout")
         check_info("Run: sudo loginctl enable-linger $USER")
         issues.append("Enable linger for the gateway user service: sudo loginctl enable-linger $USER")
-    else:
-        check_warn("Could not verify systemd linger", f"({linger_detail})")
+
+
+def _run_text_command(command: list[str]) -> str:
+    result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(stderr or f"command failed: {' '.join(command)}")
+    return (result.stdout or "").strip()
+
+
+def _latest_backup_status() -> dict:
+    repo_root = Path("/root/projects/hannibal-operating-system")
+    manifest_path = repo_root / "state" / "metadata" / "manifest.json"
+    service = "hannibal-backup.service"
+    timer = "hannibal-backup.timer"
+    out = {
+        "repo_present": repo_root.exists(),
+        "manifest_status": "unknown",
+        "manifest_timestamp": "",
+        "service_active": "unknown",
+        "timer_active": "unknown",
+        "next_trigger": "",
+    }
+    try:
+        import json as _json
+        if manifest_path.exists():
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+            out["manifest_status"] = str(manifest.get("status") or "unknown")
+            out["manifest_timestamp"] = str(manifest.get("timestamp_utc") or "")
+    except Exception:
+        pass
+    try:
+        out["service_active"] = _run_text_command(["systemctl", "is-active", service])
+    except Exception:
+        pass
+    try:
+        out["timer_active"] = _run_text_command(["systemctl", "is-active", timer])
+    except Exception:
+        pass
+    try:
+        trigger = _run_text_command(["systemctl", "show", timer, "-p", "NextElapseUSecRealtime", "--value"])
+        out["next_trigger"] = trigger
+    except Exception:
+        pass
+    return out
+
 
 
 def run_doctor(args):
@@ -724,6 +771,90 @@ def run_doctor(args):
                     print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'(HTTP {_resp.status_code})', Colors.DIM)}           ")
             except Exception as _e:
                 print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_e})', Colors.DIM)}           ")
+
+    # =========================================================================
+    # Check: Runtime resilience
+    # =========================================================================
+    print()
+    print(color("◆ Runtime Resilience", Colors.CYAN, Colors.BOLD))
+
+    try:
+        from hermes_cli.fallback_alerts import get_fallback_alert_status
+
+        status = get_fallback_alert_status()
+        config_path = HERMES_HOME / "config.yaml"
+        primary_provider = ""
+        primary_model = ""
+        fallback_provider = ""
+        fallback_model = ""
+        if config_path.exists():
+            try:
+                import yaml
+                raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                model_cfg = raw.get("model") or {}
+                primary_provider = str(model_cfg.get("provider") or "")
+                primary_model = str(model_cfg.get("default") or "")
+                fallback_cfg = raw.get("fallback_providers") or raw.get("fallback_model") or {}
+                if isinstance(fallback_cfg, list) and fallback_cfg:
+                    fallback_cfg = fallback_cfg[0]
+                if isinstance(fallback_cfg, dict):
+                    fallback_provider = str(fallback_cfg.get("provider") or "")
+                    fallback_model = str(fallback_cfg.get("model") or "")
+            except Exception:
+                pass
+
+        if primary_provider or primary_model:
+            check_ok("Primary runtime", f"{primary_provider or 'auto'} / {primary_model or '-'}")
+        else:
+            check_warn("Primary runtime", "(not readable from config)")
+
+        if fallback_provider and fallback_model:
+            check_ok("Fallback runtime", f"{fallback_provider} / {fallback_model}")
+        else:
+            check_warn("Fallback runtime", "(not configured)")
+            issues.append("Configure a fallback provider/model for outage resilience")
+
+        if status.get("slack_configured") == "yes":
+            check_ok("Fallback Slack alerts", status.get("slack_channel", ""))
+        else:
+            check_warn("Fallback Slack alerts", "(not configured)")
+            issues.append("Configure Slack fallback alerts (SLACK_BOT_TOKEN + SLACK_HOME_CHANNEL)")
+
+        if status.get("whatsapp_configured") == "yes":
+            check_ok("Fallback WhatsApp alerts", status.get("whatsapp_chat_id", ""))
+        else:
+            check_warn("Fallback WhatsApp alerts", "(not configured)")
+            issues.append("Configure WhatsApp fallback alerts (chat target missing)")
+
+        active = status.get("active") or {}
+        if active:
+            check_warn(
+                "Fallback currently active",
+                f"{active.get('fallback_provider', '-') } / {active.get('fallback_model', '-') } since {active.get('activated_at', '?')}"
+            )
+        else:
+            check_ok("Fallback currently active", "(no)")
+
+        backup = _latest_backup_status()
+        if backup.get("repo_present"):
+            check_ok("Backup repo", "/root/projects/hannibal-operating-system")
+        else:
+            check_warn("Backup repo", "(missing)")
+            issues.append("Restore or clone /root/projects/hannibal-operating-system")
+
+        if backup.get("timer_active") == "active":
+            check_ok("Nightly backup timer", backup.get("next_trigger", ""))
+        else:
+            check_warn("Nightly backup timer", f"({backup.get('timer_active', 'unknown')})")
+            issues.append("Enable hannibal-backup.timer")
+
+        if backup.get("manifest_status") == "success":
+            check_ok("Latest backup run", backup.get("manifest_timestamp", ""))
+        else:
+            check_warn("Latest backup run", f"({backup.get('manifest_status', 'unknown')})")
+            issues.append("Investigate the latest hannibal-backup run")
+    except Exception as e:
+        check_warn("Runtime resilience status", f"({e})")
 
     # =========================================================================
     # Check: Submodules

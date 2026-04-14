@@ -245,15 +245,14 @@ def test_500_server_error_is_retried_and_recovers(monkeypatch):
     assert result["final_response"] == "Recovered"
 
 
-def test_401_credential_refresh_recovers(monkeypatch):
-    """401 should trigger credential refresh and retry once."""
+def test_401_uses_fallback_without_credential_refresh(monkeypatch):
+    """401 should switch to fallback immediately without auth-refresh retry."""
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr(
         "agent.anthropic_adapter.build_anthropic_client", _fake_build_anthropic_client
     )
-    monkeypatch.setenv("HERMES_TOOL_PROGRESS", "false")
 
-    refresh_count = {"n": 0}
+    fallback_count = {"n": 0}
 
     class _Auth401ThenSuccessAgent(run_agent.AIAgent):
         def __init__(self, *args, **kwargs):
@@ -267,8 +266,13 @@ def test_401_credential_refresh_recovers(monkeypatch):
             self._save_session_log = lambda messages: None
 
         def _try_refresh_anthropic_client_credentials(self) -> bool:
-            refresh_count["n"] += 1
-            return True  # Simulate successful credential refresh
+            raise AssertionError("auth refresh retry should not run")
+
+        def _try_activate_fallback(self) -> bool:
+            fallback_count["n"] += 1
+            self.provider = "openrouter"
+            self.model = "anthropic/claude-sonnet-4.6"
+            return True
 
         def run_conversation(self, user_message, conversation_history=None, task_id=None):
             calls = {"n": 0}
@@ -277,7 +281,7 @@ def test_401_credential_refresh_recovers(monkeypatch):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise _UnauthorizedError()
-                return _anthropic_response("Auth refreshed")
+                return _anthropic_response("Fallback recovered")
 
             self._interruptible_api_call = _fake_api_call
             # Also patch streaming path — run_conversation now prefers
@@ -287,46 +291,19 @@ def test_401_credential_refresh_recovers(monkeypatch):
                 user_message, conversation_history=conversation_history, task_id=task_id
             )
 
-    monkeypatch.setattr(run_agent, "AIAgent", _Auth401ThenSuccessAgent)
-    monkeypatch.setattr(
-        gateway_run,
-        "_resolve_runtime_agent_kwargs",
-        lambda: {
-            "provider": "anthropic",
-            "api_mode": "anthropic_messages",
-            "base_url": "https://api.anthropic.com",
-            "api_key": "sk-ant-api03-test-key",
-        },
+    agent = _Auth401ThenSuccessAgent(
+        model="claude-sonnet-4-20250514",
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        base_url="https://api.anthropic.com",
+        api_key="***",
+        fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"},
     )
 
-    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
-    runner.adapters = {}
-    runner._ephemeral_system_prompt = ""
-    runner._prefill_messages = []
-    runner._reasoning_config = None
-    runner._provider_routing = {}
-    runner._fallback_model = None
-    runner._running_agents = {}
-    runner.hooks = MagicMock()
-    runner.hooks.emit = AsyncMock()
-    runner.hooks.loaded_hooks = []
-    runner._session_db = None
+    result = agent.run_conversation("hello")
 
-    source = SessionSource(
-        platform=Platform.LOCAL, chat_id="cli", chat_name="CLI",
-        chat_type="dm", user_id="test-user-1",
-    )
-
-    result = asyncio.run(
-        runner._run_agent(
-            message="hello", context_prompt="", history=[],
-            source=source, session_id="session-401",
-            session_key="agent:main:local:dm",
-        )
-    )
-
-    assert result["final_response"] == "Auth refreshed"
-    assert refresh_count["n"] == 1
+    assert result["final_response"] == "Fallback recovered"
+    assert fallback_count["n"] == 1
 
 
 def test_401_refresh_fails_is_non_retryable(monkeypatch):
