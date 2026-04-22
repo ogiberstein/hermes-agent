@@ -69,6 +69,108 @@ _SENSITIVE_WRITE_TARGET = (
     rf'{_HERMES_ENV_PATH})'
 )
 
+_HERMES_PROJECT_ROOT = os.path.realpath("/root/.hermes/hermes-agent")
+_HERMES_VENV_PATHS = {
+    os.path.realpath("/root/.hermes/hermes-agent/venv"),
+    os.path.realpath("/root/.hermes/hermes-agent/.venv"),
+}
+_HERMES_RUNTIME_TARGETS = tuple(sorted(_HERMES_VENV_PATHS | {os.path.realpath("/root/.local/bin/hermes")}))
+
+
+def _normalize_fs_path(path: str | None) -> str:
+    if not path:
+        return ""
+    expanded = os.path.expandvars(os.path.expanduser(path))
+    return os.path.realpath(expanded)
+
+
+def _path_is_under(path: str, root: str) -> bool:
+    if not path or not root:
+        return False
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _non_hermes_workdir(workdir: str | None) -> bool:
+    normalized = _normalize_fs_path(workdir)
+    return bool(normalized) and not _path_is_under(normalized, _HERMES_PROJECT_ROOT)
+
+
+def _active_env_is_hermes(env_context: dict | None) -> bool:
+    if not env_context:
+        return False
+    venv = _normalize_fs_path(env_context.get("VIRTUAL_ENV"))
+    return venv in _HERMES_VENV_PATHS
+
+
+def _command_mentions_hermes_runtime(command_lower: str) -> bool:
+    return any(target.lower() in command_lower for target in _HERMES_RUNTIME_TARGETS)
+
+
+def _is_uv_active_command(command_lower: str) -> bool:
+    return bool(
+        re.search(r"\buv\s+run\s+--active\b", command_lower)
+        or re.search(r"\buv\s+--active\s+run\b", command_lower)
+    )
+
+
+def _is_package_mutation_command(command_lower: str) -> bool:
+    return bool(
+        re.search(r"\buv\s+sync\b", command_lower)
+        or re.search(r"\buv\s+pip\b", command_lower)
+        or re.search(r"\bpip(?:3)?\s+(install|uninstall)\b", command_lower)
+        or re.search(r"\bpython(?:[23](?:\.\d+)?)?\s+-m\s+pip\s+(install|uninstall)\b", command_lower)
+    )
+
+
+def _is_runtime_target_mutation_command(command_lower: str) -> bool:
+    if not _command_mentions_hermes_runtime(command_lower):
+        return False
+    return bool(
+        re.search(r"\buv\s+venv\b", command_lower)
+        or re.search(r"\bpython(?:[23](?:\.\d+)?)?\s+-m\s+venv\b", command_lower)
+        or re.search(r"\bvirtualenv\b", command_lower)
+        or re.search(r"\brm\s+-[^\n;|&]*[rf]", command_lower)
+        or re.search(r"\bmv\b", command_lower)
+        or re.search(r"\bcp\b", command_lower)
+        or re.search(r"\bln\b", command_lower)
+        or _is_package_mutation_command(command_lower)
+    )
+
+
+def detect_non_bypassable_runtime_block(command: str,
+                                        workdir: str | None = None,
+                                        env_context: dict | None = None) -> tuple[bool, str | None]:
+    """Return a hard block decision for commands that can mutate Hermes runtime.
+
+    These blocks apply even when approval prompts are otherwise bypassed.
+    """
+    command_lower = _normalize_command_for_detection(command).lower()
+    non_hermes_workdir = _non_hermes_workdir(workdir)
+    hermes_active_env = _active_env_is_hermes(env_context)
+
+    if non_hermes_workdir and hermes_active_env and _is_uv_active_command(command_lower):
+        return True, (
+            "BLOCKED: `uv run --active` would target Hermes's active runtime from a non-Hermes repo. "
+            "Use plain `uv run ...`, an explicit repo-local `.venv/bin/python ...`, or `env -u VIRTUAL_ENV uv run ...` instead."
+        )
+
+    if non_hermes_workdir and _is_runtime_target_mutation_command(command_lower):
+        return True, (
+            "BLOCKED: command targets Hermes runtime paths from a non-Hermes repo "
+            f"({_HERMES_PROJECT_ROOT}). Do not mutate /root/.hermes/hermes-agent/venv or /root/.local/bin/hermes from project workdirs."
+        )
+
+    if non_hermes_workdir and hermes_active_env and _is_package_mutation_command(command_lower):
+        return True, (
+            "BLOCKED: package/environment mutation would run against Hermes's active virtualenv from a non-Hermes repo. "
+            "Use the repo-local environment instead."
+        )
+
+    return False, None
+
 # =========================================================================
 # Dangerous command patterns
 # =========================================================================
@@ -108,8 +210,8 @@ DANGEROUS_PATTERNS = [
     (r'\bhermes\s+gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
     # Gateway protection: never start gateway outside systemd management
-    (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
-    (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
+    (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl restart hermes-gateway.service')"),
+    (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl restart hermes-gateway.service')"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
     # Self-termination via kill + command substitution (pgrep/pidof).
@@ -713,16 +815,35 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def check_all_command_guards(command: str, env_type: str,
-                             approval_callback=None) -> dict:
-    """Run all pre-exec security checks and return a single approval decision.
+                             approval_callback=None,
+                             workdir: str | None = None,
+                             env_context: dict | None = None,
+                             skip_approvals: bool = False) -> dict:
+    """Run all pre-exec security checks and return a single combined decision.
 
-    Gathers findings from tirith and dangerous-command detection, then
-    presents them as a single combined approval request. This prevents
-    a gateway force=True replay from bypassing one check when only the
-    other was shown to the user.
+    Non-bypassable runtime mutation guards run first. Approval-based checks
+    (tirith + dangerous command detection) run only when approvals are enabled.
     """
     # Skip containers for both checks
     if env_type in ("docker", "singularity", "modal", "daytona"):
+        return {"approved": True, "message": None}
+
+    hard_blocked, hard_block_message = detect_non_bypassable_runtime_block(
+        command,
+        workdir=workdir,
+        env_context=env_context,
+    )
+    if hard_blocked:
+        return {
+            "approved": False,
+            "message": hard_block_message,
+            "status": "blocked",
+            "description": hard_block_message,
+            "pattern_key": "hermes_runtime_mutation",
+        }
+
+    # Explicit confirmation can bypass approval prompts, but never the hard block above.
+    if skip_approvals:
         return {"approved": True, "message": None}
 
     # --yolo or approvals.mode=off: bypass all approval prompts.

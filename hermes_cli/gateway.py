@@ -1334,7 +1334,7 @@ def _print_linger_enable_warning(username: str, detail: str | None = None) -> No
     print(f"    sudo loginctl enable-linger {username}")
     print()
     print("  Then restart the gateway:")
-    print(f"    systemctl --user restart {get_service_name()}.service")
+    print(f"    systemctl restart {get_service_name()}.service")
     print()
 
 
