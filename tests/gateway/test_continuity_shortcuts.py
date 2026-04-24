@@ -97,6 +97,17 @@ async def test_plain_bootstrap_expands_before_agent_run_with_explicit_context_se
 
 
 @pytest.mark.asyncio
+async def test_plain_handover_command_phrase_expands_before_agent_run():
+    runner = _make_runner()
+
+    result = await runner._handle_message(_make_event("handover command"))
+
+    assert result == "ok"
+    forwarded_event = runner._handle_message_with_agent.await_args.args[0]
+    assert "Close this thread with handoff" in forwarded_event.text
+
+
+@pytest.mark.asyncio
 async def test_plain_review_sentence_does_not_expand():
     runner = _make_runner()
 

@@ -52,6 +52,14 @@ def test_expand_plain_shortcut_for_status():
     assert "decision-grade" in prompt
 
 
+def test_expand_plain_handover_command_phrase():
+    expanded = expand_plain_shortcut("handover command")
+    assert expanded is not None
+    name, prompt = expanded
+    assert name == "handoff"
+    assert "Close this thread with handoff" in prompt
+
+
 def test_expand_plain_shortcut_ignores_slash_commands_unknown_text_and_sentences():
     assert expand_plain_shortcut("/bootstrap") is None
     assert expand_plain_shortcut("hello there") is None

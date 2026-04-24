@@ -179,7 +179,11 @@ def expand_plain_shortcut(text: str) -> tuple[str, str] | None:
     if keyword.endswith(":"):
         extra = (separator + remainder).strip()
     elif remainder:
-        return None
+        # Natural-language invocations like "handover command" should still
+        # behave as the bare shortcut, while ordinary sentences such as
+        # "review the PR" remain untouched.
+        if remainder.strip().lower() != "command":
+            return None
 
     prompt = build_shortcut_prompt(shortcut.name, extra)
     if prompt is None:
