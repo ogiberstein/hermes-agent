@@ -5839,6 +5839,7 @@ class HermesCLI:
         # Resolve aliases via central registry so adding an alias is a one-line
         # change in hermes_cli/commands.py instead of touching every dispatch site.
         from hermes_cli.commands import resolve_command as _resolve_cmd
+        from agent.continuity_shortcuts import COMMAND_SHORTCUT_NAMES
         _base_word = cmd_lower.split()[0].lstrip("/")
         _cmd_def = _resolve_cmd(_base_word)
         canonical = _cmd_def.name if _cmd_def else _base_word
@@ -6117,6 +6118,17 @@ class HermesCLI:
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
             self._handle_voice_command(cmd_original)
+        elif canonical in COMMAND_SHORTCUT_NAMES:
+            from agent.continuity_shortcuts import build_shortcut_prompt
+
+            parts = cmd_original.split(None, 1)
+            payload = parts[1].strip() if len(parts) > 1 else ""
+            prompt = build_shortcut_prompt(canonical, payload)
+            if prompt:
+                self._pending_input.put(prompt)
+                _cprint(f"  Queued /{canonical} continuity shortcut")
+            else:
+                self.console.print(f"[bold red]Failed to build continuity shortcut '/{canonical}'[/]")
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
@@ -10523,6 +10535,15 @@ class HermesCLI:
                                 f"[User attached file: {_drop_path}]"
                                 + (f"\n{_remainder}" if _remainder else "")
                             )
+
+                    if not _file_drop and isinstance(user_input, str):
+                        from agent.continuity_shortcuts import expand_plain_shortcut
+
+                        plain_shortcut = expand_plain_shortcut(user_input)
+                        if plain_shortcut:
+                            shortcut_name, shortcut_prompt = plain_shortcut
+                            _cprint(f"\n⚙️  {shortcut_name} → continuity shortcut")
+                            user_input = shortcut_prompt
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
                         _cprint(f"\n⚙️  {user_input}")

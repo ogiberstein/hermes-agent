@@ -19,6 +19,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from agent.continuity_shortcuts import COMMAND_SHORTCUTS
+
 # prompt_toolkit is an optional CLI dependency — only needed for
 # SlashCommandCompleter and SlashCommandAutoSuggest.  Gateway and test
 # environments that lack it must still be able to import this module
@@ -93,6 +95,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
                args_hint="<prompt>"),
+    *(
+        CommandDef(
+            shortcut.name,
+            shortcut.description,
+            "Session",
+            aliases=shortcut.aliases,
+            args_hint="[context]",
+        )
+        for shortcut in COMMAND_SHORTCUTS
+    ),
     CommandDef("status", "Show session info", "Session"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
@@ -180,12 +192,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
 # ---------------------------------------------------------------------------
 
 def _build_command_lookup() -> dict[str, CommandDef]:
-    """Map every name and alias to its CommandDef."""
+    """Map every command name and alias to its CommandDef, rejecting collisions."""
     lookup: dict[str, CommandDef] = {}
     for cmd in COMMAND_REGISTRY:
-        lookup[cmd.name] = cmd
-        for alias in cmd.aliases:
-            lookup[alias] = cmd
+        for name in (cmd.name, *cmd.aliases):
+            if name in lookup:
+                raise ValueError(
+                    f"Slash command name/alias collision for {name!r}: "
+                    f"{lookup[name].name!r} and {cmd.name!r}"
+                )
+            lookup[name] = cmd
     return lookup
 
 

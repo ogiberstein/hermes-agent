@@ -14,6 +14,7 @@ from hermes_cli.commands import (
     SlashCommandCompleter,
     _CMD_NAME_LIMIT,
     _TG_NAME_LIMIT,
+    _build_command_lookup,
     _clamp_command_names,
     _clamp_telegram_names,
     _sanitize_telegram_name,
@@ -24,6 +25,7 @@ from hermes_cli.commands import (
     telegram_bot_commands,
     telegram_menu_commands,
 )
+from agent.continuity_shortcuts import COMMAND_SHORTCUTS
 
 
 def _completions(completer: SlashCommandCompleter, text: str):
@@ -84,6 +86,31 @@ class TestCommandRegistry:
             assert not (cmd.cli_only and cmd.gateway_only), \
                 f"{cmd.name} cannot be both cli_only and gateway_only"
 
+    def test_command_lookup_accepts_real_registry(self):
+        lookup = _build_command_lookup()
+        assert lookup["handoff"].name == "handoff"
+        assert lookup["handover"].name == "handoff"
+
+    def test_command_lookup_rejects_name_and_alias_collisions(self, monkeypatch):
+        import hermes_cli.commands as commands
+
+        monkeypatch.setattr(
+            commands,
+            "COMMAND_REGISTRY",
+            [
+                CommandDef("alpha", "first", "Session", aliases=("shared",)),
+                CommandDef("beta", "second", "Session", aliases=("shared",)),
+            ],
+        )
+
+        try:
+            _build_command_lookup()
+        except ValueError as exc:
+            assert "collision" in str(exc)
+            assert "shared" in str(exc)
+        else:
+            raise AssertionError("Expected slash command alias collision to fail fast")
+
 
 # ---------------------------------------------------------------------------
 # resolve_command tests
@@ -109,6 +136,16 @@ class TestResolveCommand:
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
+
+    def test_continuity_shortcuts_are_registered_commands(self):
+        for shortcut in COMMAND_SHORTCUTS:
+            assert resolve_command(shortcut.name).name == shortcut.name
+            assert shortcut.name in GATEWAY_KNOWN_COMMANDS
+            assert f"/{shortcut.name}" in COMMANDS
+            for alias in shortcut.aliases:
+                assert resolve_command(alias).name == shortcut.name
+                assert alias in GATEWAY_KNOWN_COMMANDS
+                assert f"/{alias}" in COMMANDS
 
     def test_unknown_returns_none(self):
         assert resolve_command("nonexistent") is None

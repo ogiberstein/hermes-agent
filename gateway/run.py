@@ -3483,6 +3483,19 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
 
+        if event.text and not event.text.startswith("/"):
+            from agent.continuity_shortcuts import expand_plain_shortcut
+
+            plain_shortcut = expand_plain_shortcut(event.text)
+            if plain_shortcut:
+                shortcut_name, shortcut_prompt = plain_shortcut
+                logger.info(
+                    "Expanded plain continuity shortcut '%s' for %s",
+                    shortcut_name,
+                    source.platform.value if source.platform else "?",
+                )
+                event.text = shortcut_prompt
+
         # Check for commands
         command = event.get_command()
         
@@ -3637,6 +3650,17 @@ class GatewayRunner:
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
+
+        if canonical:
+            from agent.continuity_shortcuts import COMMAND_SHORTCUT_NAMES, build_shortcut_prompt
+
+            if canonical in COMMAND_SHORTCUT_NAMES:
+                prompt = build_shortcut_prompt(canonical, event.get_command_args().strip())
+                if not prompt:
+                    return f"Failed to build continuity shortcut '/{canonical}'."
+                event.text = prompt
+                command = None
+                canonical = None
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
