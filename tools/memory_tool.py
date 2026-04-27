@@ -56,6 +56,65 @@ def get_memory_dir() -> Path:
 
 ENTRY_DELIMITER = "\n§\n"
 
+# Canonical memory-governance labels used by scripts/memory_audit.py.
+# Keep these pure/module-level so the audit script can run without creating a
+# MemoryStore and without duplicating schema constants.
+_SNAPSHOT_REQUIRED_FIELDS = ("Latest discussed", "Next step")
+_SNAPSHOT_OPTIONAL_FIELDS = ("Risk watch",)
+_SNAPSHOT_LEGACY_FIELDS = ("What/why", "Current thing", "Waiting for")
+_COS_INDEX_REQUIRED_FIELDS = (
+    "Top priorities",
+    "Project one-liners",
+    "Cross-project risks/conflicts",
+)
+
+
+def _extract_labeled_fields(content: str) -> Dict[str, str]:
+    """Extract simple `Label: value` fields from a memory entry.
+
+    Continuation lines are appended to the previous label. This intentionally
+    stays conservative: memory governance labels are human-written markdown-ish
+    lines, not arbitrary nested structures.
+    """
+    fields: Dict[str, str] = {}
+    current_label: Optional[str] = None
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^[-*]?\s*([^:\n]{1,80}):\s*(.*)$", line)
+        if match:
+            current_label = match.group(1).strip()
+            fields[current_label] = match.group(2).strip()
+        elif current_label:
+            fields[current_label] = f"{fields[current_label]} {line}".strip()
+    return fields
+
+
+def _is_snapshot_like(fields: Dict[str, str]) -> bool:
+    """Return True when fields look like a project rolling snapshot."""
+    snapshot_fields = set(_SNAPSHOT_REQUIRED_FIELDS) | set(_SNAPSHOT_OPTIONAL_FIELDS) | set(_SNAPSHOT_LEGACY_FIELDS)
+    return bool(snapshot_fields.intersection(fields))
+
+
+def _is_cos_index(content: str, fields: Optional[Dict[str, str]] = None) -> bool:
+    """Return True when an entry is the USER-level CoS index."""
+    if fields is None:
+        fields = _extract_labeled_fields(content)
+    return bool(set(_COS_INDEX_REQUIRED_FIELDS).intersection(fields))
+
+
+def _known_project_keys(mem_dir: Path) -> set[str]:
+    """Return project keys inferred from MEMORY.<project>.md shard filenames."""
+    if not mem_dir.exists():
+        return set()
+    keys: set[str] = set()
+    for path in mem_dir.glob("MEMORY.*.md"):
+        key = path.name.removeprefix("MEMORY.").removesuffix(".md").strip().lower()
+        if key:
+            keys.add(key)
+    return keys
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration

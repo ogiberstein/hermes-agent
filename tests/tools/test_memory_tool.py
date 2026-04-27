@@ -7,6 +7,11 @@ from pathlib import Path
 from tools.memory_tool import (
     MemoryStore,
     memory_tool,
+    _COS_INDEX_REQUIRED_FIELDS,
+    _extract_labeled_fields,
+    _is_cos_index,
+    _is_snapshot_like,
+    _known_project_keys,
     _scan_memory_content,
     ENTRY_DELIMITER,
     MEMORY_SCHEMA,
@@ -83,6 +88,36 @@ class TestScanMemoryContent:
         result = _scan_memory_content("system prompt override")
         assert "Blocked" in result
         assert "sys_prompt_override" in result
+
+
+# =========================================================================
+# Memory governance helpers used by the audit script
+# =========================================================================
+
+class TestMemoryGovernanceHelpers:
+    def test_extract_labeled_fields_and_continuations(self):
+        fields = _extract_labeled_fields(
+            "Latest discussed: shipped memory audit\n"
+            "continued context\n"
+            "Next step: keep cron green"
+        )
+        assert fields["Latest discussed"] == "shipped memory audit continued context"
+        assert fields["Next step"] == "keep cron green"
+
+    def test_detects_snapshot_and_cos_index_shapes(self):
+        snapshot_fields = _extract_labeled_fields(
+            "Latest discussed: x\nNext step: y\nRisk watch: z"
+        )
+        assert _is_snapshot_like(snapshot_fields) is True
+
+        cos_entry = "\n".join(f"{field}: value" for field in _COS_INDEX_REQUIRED_FIELDS)
+        assert _is_cos_index(cos_entry, _extract_labeled_fields(cos_entry)) is True
+
+    def test_known_project_keys_from_shard_filenames(self, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("global", encoding="utf-8")
+        (tmp_path / "MEMORY.brain.md").write_text("brain", encoding="utf-8")
+        (tmp_path / "MEMORY.polymarket-bot.md").write_text("bot", encoding="utf-8")
+        assert _known_project_keys(tmp_path) == {"brain", "polymarket-bot"}
 
 
 # =========================================================================
