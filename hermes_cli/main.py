@@ -9598,6 +9598,58 @@ Examples:
     mcp_parser.set_defaults(func=cmd_mcp)
 
     # =========================================================================
+    # brainbench command — capture/export/replay recall-search evals
+    # =========================================================================
+    brainbench_parser = subparsers.add_parser(
+        "brainbench",
+        help="Export and replay opt-in recall-search eval captures",
+        description=(
+            "BrainBench-lite captures session_search retrievals when "
+            "HERMES_BRAINBENCH_CAPTURE=1 is set, redacts obvious PII, and "
+            "replays them against the current session DB to detect recall drift."
+        ),
+    )
+    brainbench_sub = brainbench_parser.add_subparsers(dest="brainbench_action")
+
+    brainbench_export = brainbench_sub.add_parser("export", help="Export captured candidates as NDJSON")
+    brainbench_export.add_argument("output", nargs="?", default="-", help="Output path, or - for stdout")
+    brainbench_export.add_argument("--input", help="Input candidates file (defaults to Hermes brainbench store)")
+    brainbench_export.add_argument("--limit", type=int, help="Maximum rows to export")
+
+    brainbench_replay = brainbench_sub.add_parser("replay", help="Replay captured candidates against current session DB")
+    brainbench_replay.add_argument("--against", help="Input NDJSON snapshot (defaults to Hermes brainbench store)")
+    brainbench_replay.add_argument("--limit", type=int, help="Maximum rows to replay")
+    brainbench_replay.add_argument("--top-regressions", type=int, default=5, help="Number of lowest-Jaccard rows to show")
+    brainbench_replay.add_argument("--json", action="store_true", help="Print machine-readable JSON report")
+
+    def cmd_brainbench(args):
+        from hermes_cli.brainbench import export_candidates, print_replay_report, replay_candidates
+
+        action = getattr(args, "brainbench_action", None)
+        if action == "export":
+            export_candidates(
+                input_path=getattr(args, "input", None),
+                output_path=getattr(args, "output", "-"),
+                limit=getattr(args, "limit", None),
+            )
+            return
+        if action == "replay":
+            from hermes_state import SessionDB
+
+            db = SessionDB()
+            report = replay_candidates(
+                db=db,
+                input_path=getattr(args, "against", None),
+                limit=getattr(args, "limit", None),
+                top_regressions=getattr(args, "top_regressions", 5),
+            )
+            print_replay_report(report, json_output=getattr(args, "json", False))
+            return
+        brainbench_parser.print_help()
+
+    brainbench_parser.set_defaults(func=cmd_brainbench)
+
+    # =========================================================================
     # sessions command
     # =========================================================================
     sessions_parser = subparsers.add_parser(

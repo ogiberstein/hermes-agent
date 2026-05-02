@@ -19,7 +19,9 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import os
 import re
+import time
 from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
@@ -360,6 +362,7 @@ def session_search(
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
         # FTS5 search -- get matches ranked by relevance
+        search_started = time.perf_counter()
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
@@ -367,6 +370,23 @@ def session_search(
             limit=50,  # Get more matches to find unique sessions
             offset=0,
         )
+        search_latency_ms = int((time.perf_counter() - search_started) * 1000)
+        if os.getenv("HERMES_BRAINBENCH_CAPTURE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                from hermes_cli.brainbench import capture_search_event
+
+                capture_search_event(
+                    "session_search",
+                    query,
+                    [result.get("session_id") for result in raw_results],
+                    search_latency_ms,
+                    metadata={
+                        "role_filter": role_filter,
+                        "exclude_sources": list(_HIDDEN_SESSION_SOURCES),
+                    } if role_filter else {"exclude_sources": list(_HIDDEN_SESSION_SOURCES)},
+                )
+            except Exception:
+                logging.debug("BrainBench-lite capture failed", exc_info=True)
 
         if not raw_results:
             return json.dumps({
