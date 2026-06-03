@@ -4,11 +4,13 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -210,6 +212,198 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         sanitized["HOME"] = _profile_home
 
     return sanitized
+
+
+def _gateway_systemd_isolation_enabled() -> bool:
+    """Return True when local terminal commands should leave the gateway cgroup."""
+    if _IS_WINDOWS:
+        return False
+    if os.getenv("HERMES_TERMINAL_SYSTEMD_ISOLATION", "1").lower() in {"0", "false", "no", "off"}:
+        return False
+
+    # Only force systemd isolation from messaging gateway sessions. Prefer the
+    # per-message ContextVar set by gateway/run.py; fall back to the service env
+    # for older runtimes and systemd smoke tests. Do not require a systemd env
+    # flag because production services may not set it, which made the previous
+    # isolation patch inert.
+    platform_name = ""
+    try:
+        from gateway.session_context import get_session_env
+        platform_name = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").lower()
+    except Exception:
+        platform_name = ""
+    is_gateway_session = bool(os.getenv("HERMES_GATEWAY_SESSION")) or platform_name in {
+        "slack",
+        "telegram",
+        "discord",
+        "whatsapp",
+        "signal",
+        "matrix",
+        "mattermost",
+        "email",
+        "sms",
+        "feishu",
+        "wechat",
+        "wecom",
+        "api_server",
+        "webhook",
+    }
+    if not is_gateway_session:
+        return False
+    return bool(shutil.which("systemd-run") or os.path.exists("/usr/bin/systemd-run"))
+
+
+def _gateway_terminal_timeout_seconds(timeout_seconds: int | None) -> int | None:
+    """Cap gateway transient-service command lifetime to protect messaging."""
+    if not timeout_seconds:
+        return timeout_seconds
+    raw_cap = os.getenv("HERMES_GATEWAY_TERMINAL_TIMEOUT_MAX", "180")
+    try:
+        cap = int(raw_cap)
+    except (TypeError, ValueError):
+        cap = 180
+    if cap <= 0:
+        return timeout_seconds
+    return min(int(timeout_seconds), cap)
+
+
+def make_systemd_unit_name(prefix: str = "hermes-terminal") -> str:
+    """Return a unique transient systemd unit name for isolated gateway work."""
+    safe_prefix = re.sub(r"[^A-Za-z0-9_.-]", "-", prefix).strip("-.") or "hermes-terminal"
+    return f"{safe_prefix}-{uuid.uuid4().hex[:12]}"
+
+
+SYSTEMD_ENV_FILE_PREFIX = "hermes-terminal-env-"
+
+
+def _cleanup_stale_systemd_env_files(max_age_seconds: int = 3600) -> None:
+    """Best-effort cleanup for abandoned transient-service env files.
+
+    Normal launches remove the file inside the transient service before exec.
+    This sweep limits secret-at-rest lifetime when systemd-run fails before the
+    service shell starts. Only files owned by this uid are considered.
+    """
+    if _IS_WINDOWS:
+        return
+    now = time.time()
+    try:
+        for path in Path("/tmp").glob(f"{SYSTEMD_ENV_FILE_PREFIX}*"):
+            try:
+                st = path.stat()
+                if st.st_uid == os.getuid() and now - st.st_mtime > max_age_seconds:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _systemd_env_files_from_command(args: list[str]) -> list[str]:
+    """Return Hermes transient-service env files embedded in a systemd-run argv."""
+    files: list[str] = []
+    for part in args:
+        if isinstance(part, str) and Path(part).name.startswith(SYSTEMD_ENV_FILE_PREFIX):
+            files.append(part)
+    return files
+
+
+def _cleanup_systemd_env_files_from_command(args: list[str]) -> None:
+    """Remove env temp files from a failed systemd-run launch, best effort."""
+    for env_file in _systemd_env_files_from_command(args):
+        try:
+            path = Path(env_file)
+            if path.parent == Path("/tmp") and path.name.startswith(SYSTEMD_ENV_FILE_PREFIX):
+                path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _systemd_run_command(
+    args: list[str],
+    run_env: dict[str, str],
+    *,
+    timeout_seconds: int | None = None,
+    unit_name: str | None = None,
+    unit_prefix: str = "hermes-terminal",
+    memory_env_prefix: str = "HERMES_TERMINAL",
+    pty: bool = False,
+    cwd: str | None = None,
+) -> list[str]:
+    """Wrap a command in a transient service so it cannot OOM the gateway unit.
+
+    `systemd-run --scope` cannot be combined with `--pipe`, so use a transient
+    service with `--pipe --wait --collect`: Hermes still receives stdout/stderr
+    and the actual workload runs in its own cgroup with a memory ceiling.
+    """
+    _cleanup_stale_systemd_env_files()
+    systemd_run = shutil.which("systemd-run") or "/usr/bin/systemd-run"
+    memory_max = os.getenv(f"{memory_env_prefix}_MEMORY_MAX", os.getenv("HERMES_TERMINAL_MEMORY_MAX", "2500M"))
+    memory_high = os.getenv(f"{memory_env_prefix}_MEMORY_HIGH", os.getenv("HERMES_TERMINAL_MEMORY_HIGH", "1800M"))
+    memory_swap_max = os.getenv(f"{memory_env_prefix}_MEMORY_SWAP_MAX", os.getenv("HERMES_TERMINAL_MEMORY_SWAP_MAX", "500M"))
+    unit = unit_name or make_systemd_unit_name(unit_prefix)
+    service_args = list(args)
+    timeout_bin = shutil.which("timeout") or "/usr/bin/timeout"
+    effective_timeout = _gateway_terminal_timeout_seconds(timeout_seconds)
+    if effective_timeout and os.path.exists(timeout_bin):
+        # Ensure the transient service stops itself before Hermes' outer wait
+        # loop gives up; otherwise killing systemd-run can leave the service alive.
+        service_args = [timeout_bin, "--kill-after=5s", f"{int(effective_timeout)}s", *service_args]
+
+    # Do not pass the child environment with systemd-run --setenv=KEY=VALUE:
+    # systemd-run stays as a small client process in hermes-gateway.service's
+    # cgroup while the transient unit runs, and its command line is visible via
+    # ps/systemctl status. Put env values in a 0600 temp file, source it inside
+    # the transient service, then remove it before exec'ing the real command.
+    env_file = ""
+    safe_items: list[tuple[str, str]] = []
+    for key, value in sorted(run_env.items()):
+        value_str = str(value)
+        if "\x00" in key or "\x00" in value_str or not key.replace("_", "A").isalnum() or key[0].isdigit():
+            continue
+        safe_items.append((key, value_str))
+    if safe_items:
+        fd, env_file = tempfile.mkstemp(prefix=SYSTEMD_ENV_FILE_PREFIX, dir="/tmp", text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for key, value in safe_items:
+                    f.write(f"export {key}={shlex.quote(value)}\n")
+            os.chmod(env_file, 0o600)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.unlink(env_file)
+            except OSError:
+                pass
+            raise
+        bash_bin = shutil.which("bash") or "/usr/bin/bash"
+        service_args = [
+            bash_bin,
+            "-lc",
+            "env_file=$1; shift; trap 'rm -f \"$env_file\"' EXIT; set -a; . \"$env_file\"; rm -f \"$env_file\"; trap - EXIT; set +a; exec \"$@\"",
+            "hermes-terminal-env",
+            env_file,
+            *service_args,
+        ]
+
+    stdio_flag = "--pty" if pty else "--pipe"
+
+    return [
+        systemd_run,
+        "--quiet",
+        stdio_flag,
+        "--wait",
+        "--collect",
+        f"--unit={unit}",
+        *( [f"--working-directory={cwd}"] if cwd else [] ),
+        "-p", f"MemoryHigh={memory_high}",
+        "-p", f"MemoryMax={memory_max}",
+        "-p", f"MemorySwapMax={memory_swap_max}",
+        "-p", "OOMPolicy=stop",
+        *service_args,
+    ]
 
 
 def _find_bash() -> str:
@@ -490,20 +684,9 @@ class LocalEnvironment(BaseEnvironment):
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by
-        # a previous tool call that ran ``rm -rf`` on its own working dir
-        # (issue #17558).  Popen would otherwise raise FileNotFoundError on
-        # the cwd before bash starts, wedging every subsequent call until the
-        # gateway restarts.
-        #
-        # On Windows, ``_resolve_safe_cwd`` also normalises Git Bash-style
-        # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
-        # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
-        # and spammed as a warning on every command.
+        # a previous tool call that ran ``rm -rf`` on its own working dir.
         safe_cwd = _resolve_safe_cwd(self.cwd)
         if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
             normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
             if safe_cwd != normalized:
                 logger.warning(
@@ -515,22 +698,42 @@ class LocalEnvironment(BaseEnvironment):
             self.cwd = safe_cwd
 
         _popen_cwd = self.cwd
-
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        popen_args = args
+        popen_env = run_env
+        # In gateway mode, run terminal workloads in transient systemd services
+        # rather than hermes-gateway.service's cgroup.
+        if not login and _gateway_systemd_isolation_enabled():
+            unit_name = make_systemd_unit_name()
+            popen_args = _systemd_run_command(
+                args,
+                run_env,
+                timeout_seconds=timeout,
+                unit_name=unit_name,
+                cwd=_popen_cwd,
+            )
+            popen_env = {
+                "PATH": run_env.get("PATH", _SANE_PATH),
+                "SYSTEMD_COLORS": "0",
+            }
 
-        proc = subprocess.Popen(
-            args,
-            text=True,
-            env=run_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
-            cwd=_popen_cwd,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                popen_args,
+                text=True,
+                env=popen_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                preexec_fn=None if _IS_WINDOWS else os.setsid,
+                cwd=_popen_cwd,
+                **_popen_kwargs,
+            )
+        except Exception:
+            _cleanup_systemd_env_files_from_command(popen_args)
+            raise
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)

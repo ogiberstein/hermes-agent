@@ -41,7 +41,15 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _cleanup_systemd_env_files_from_command,
+    _find_shell,
+    _gateway_systemd_isolation_enabled,
+    _resolve_safe_cwd,
+    _sanitize_subprocess_env,
+    _systemd_run_command,
+    make_systemd_unit_name,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -103,7 +111,8 @@ class ProcessSession:
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
-    pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    pid_scope: str = "host"                     # "host", "systemd-service", or "sandbox"
+    systemd_unit: str = ""                       # Transient unit for gateway-isolated local jobs
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -413,12 +422,60 @@ class ProcessRegistry:
         from gateway.status import _pid_exists
         return _pid_exists(pid)
 
+    @staticmethod
+    def _systemd_unit_status(unit_name: str) -> dict[str, str]:
+        """Return systemd unit properties for a transient unit, best effort."""
+        if not unit_name or _IS_WINDOWS:
+            return {}
+        try:
+            result = subprocess.run(
+                ["systemctl", "show", unit_name, "-p", "ActiveState", "-p", "SubState", "-p", "MainPID"],
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return {}
+        if result.returncode != 0:
+            return {}
+        props: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key:
+                props[key] = value.strip()
+        return props
+
+    @classmethod
+    def _systemd_unit_state(cls, unit_name: str) -> tuple[bool, int | None]:
+        """Return (active, main_pid) using the transient unit, not systemd-run PID."""
+        props = cls._systemd_unit_status(unit_name)
+        active_state = props.get("ActiveState", "")
+        sub_state = props.get("SubState", "")
+        active = active_state == "active" and sub_state not in {"dead", "failed", "exited"}
+        main_pid = None
+        try:
+            value = int(props.get("MainPID", "0") or "0")
+            main_pid = value if value > 0 else None
+        except ValueError:
+            main_pid = None
+        return active, main_pid
+
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
-        """Update recovered host-PID sessions when the underlying process has exited."""
-        if session is None or session.exited or not session.detached or session.pid_scope != "host":
+        """Update recovered sessions when the underlying process/unit has exited."""
+        if session is None or session.exited or not session.detached:
             return session
 
-        if self._is_host_pid_alive(session.pid):
+        if session.pid_scope == "systemd-service":
+            active, main_pid = self._systemd_unit_state(session.systemd_unit)
+            if active:
+                if main_pid:
+                    session.pid = main_pid
+                return session
+        elif session.pid_scope == "host":
+            if self._is_host_pid_alive(session.pid):
+                return session
+        else:
             return session
 
         with session._lock:
@@ -497,6 +554,26 @@ class ProcessRegistry:
             except (OSError, ProcessLookupError, PermissionError):
                 pass
 
+    @staticmethod
+    def _terminate_systemd_unit(unit_name: str) -> None:
+        """Best-effort termination of a transient systemd service and all children."""
+        if not unit_name:
+            return
+        for args in (
+            ["systemctl", "kill", "--kill-whom=all", unit_name],
+            ["systemctl", "stop", unit_name],
+        ):
+            try:
+                subprocess.run(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+                logger.debug("Best-effort systemd unit termination failed for %s: %s", unit_name, exc)
+
     # ----- Spawn -----
 
     @staticmethod
@@ -550,12 +627,31 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
-                pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
-                    cwd=session.cwd,
-                    env=pty_env,
-                    dimensions=(30, 120),
-                )
+                pty_args = [user_shell, "-lic", f"set +m; {command}"]
+                if _gateway_systemd_isolation_enabled():
+                    session.systemd_unit = make_systemd_unit_name("hermes-terminal-pty")
+                    session.pid_scope = "systemd-service"
+                    pty_args = _systemd_run_command(
+                        pty_args,
+                        pty_env,
+                        unit_name=session.systemd_unit,
+                        pty=True,
+                        cwd=session.cwd,
+                    )
+                    pty_env = {
+                        "PATH": pty_env.get("PATH", os.environ.get("PATH", "")),
+                        "SYSTEMD_COLORS": "0",
+                    }
+                try:
+                    pty_proc = _PtyProcessCls.spawn(
+                        pty_args,
+                        cwd=session.cwd,
+                        env=pty_env,
+                        dimensions=(30, 120),
+                    )
+                except Exception:
+                    _cleanup_systemd_env_files_from_command(pty_args)
+                    raise
                 session.pid = pty_proc.pid
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
@@ -592,20 +688,38 @@ class ProcessRegistry:
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
-
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
-            **_popen_kwargs,
-        )
+        popen_args = [user_shell, "-lic", f"set +m; {command}"]
+        popen_env = bg_env
+        if _gateway_systemd_isolation_enabled():
+            session.systemd_unit = make_systemd_unit_name()
+            session.pid_scope = "systemd-service"
+            popen_args = _systemd_run_command(
+                popen_args,
+                bg_env,
+                unit_name=session.systemd_unit,
+                cwd=session.cwd,
+            )
+            popen_env = {
+                "PATH": bg_env.get("PATH", os.environ.get("PATH", "")),
+                "SYSTEMD_COLORS": "0",
+            }
+        try:
+            proc = subprocess.Popen(
+                popen_args,
+                text=True,
+                cwd=session.cwd,
+                env=popen_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                preexec_fn=None if _IS_WINDOWS else os.setsid,
+                **_popen_kwargs,
+            )
+        except Exception:
+            _cleanup_systemd_env_files_from_command(popen_args)
+            raise
 
         session.process = proc
         session.pid = proc.pid
@@ -1125,6 +1239,8 @@ class ProcessRegistry:
 
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
+            if session.systemd_unit:
+                self._terminate_systemd_unit(session.systemd_unit)
             if session._pty:
                 # PTY process -- terminate via ptyprocess
                 try:
@@ -1154,6 +1270,17 @@ class ProcessRegistry:
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+            elif session.detached and session.pid_scope == "systemd-service" and session.systemd_unit:
+                active, _main_pid = self._systemd_unit_state(session.systemd_unit)
+                if not active:
+                    with session._lock:
+                        session.exited = True
+                        session.exit_code = None
+                    self._move_to_finished(session)
+                    return {
+                        "status": "already_exited",
+                        "exit_code": session.exit_code,
+                    }
             elif session.detached and session.pid_scope == "host" and session.pid:
                 if not self._is_host_pid_alive(session.pid):
                     with session._lock:
@@ -1365,6 +1492,7 @@ class ProcessRegistry:
                             "command": s.command,
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
+                            "systemd_unit": s.systemd_unit,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
                             "task_id": s.task_id,
@@ -1403,11 +1531,12 @@ class ProcessRegistry:
         recovered = 0
         for entry in entries:
             pid = entry.get("pid")
-            if not pid:
+            pid_scope = entry.get("pid_scope", "host")
+            systemd_unit = entry.get("systemd_unit", "")
+            if not pid and pid_scope != "systemd-service":
                 continue
 
-            pid_scope = entry.get("pid_scope", "host")
-            if pid_scope != "host":
+            if pid_scope not in {"host", "systemd-service"}:
                 # Sandbox-backed processes keep only in-sandbox PIDs in the
                 # checkpoint, which are not meaningful to the restarted host
                 # process once the original environment handle is gone.
@@ -1419,8 +1548,14 @@ class ProcessRegistry:
                 )
                 continue
 
-            # Check if PID is still alive
-            alive = self._is_host_pid_alive(pid)
+            # Check if PID/unit is still alive.  For systemd-isolated jobs, the
+            # transient unit is authoritative; the recorded PID is only the
+            # systemd-run client and may be gone after a gateway restart.
+            main_pid = None
+            if pid_scope == "systemd-service":
+                alive, main_pid = self._systemd_unit_state(systemd_unit)
+            else:
+                alive = self._is_host_pid_alive(pid)
 
             if alive:
                 session = ProcessSession(
@@ -1428,8 +1563,9 @@ class ProcessRegistry:
                     command=entry.get("command", "unknown"),
                     task_id=entry.get("task_id", ""),
                     session_key=entry.get("session_key", ""),
-                    pid=pid,
+                    pid=main_pid or pid or 0,
                     pid_scope=pid_scope,
+                    systemd_unit=systemd_unit,
                     cwd=entry.get("cwd"),
                     started_at=entry.get("started_at", time.time()),
                     detached=True,  # Can't read output, but can report status + kill
@@ -1446,7 +1582,7 @@ class ProcessRegistry:
                 with self._lock:
                     self._running[session.id] = session
                 recovered += 1
-                logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+                logger.info("Recovered detached process: %s (pid=%d, unit=%s)", session.command[:60], session.pid, session.systemd_unit)
 
                 # Re-enqueue watcher so gateway can resume notifications
                 if session.watcher_interval > 0:

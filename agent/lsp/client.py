@@ -44,6 +44,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
@@ -161,6 +163,7 @@ class LSPClient:
 
         # Process + streams
         self._proc: Optional[asyncio.subprocess.Process] = None
+        self._systemd_unit: str = ""
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
 
@@ -244,25 +247,88 @@ class LSPClient:
             await self._cleanup_process()
             raise
 
+    def _should_use_systemd_isolation(self) -> bool:
+        try:
+            from tools.environments.local import _gateway_systemd_isolation_enabled
+            return _gateway_systemd_isolation_enabled()
+        except Exception:
+            return False
+
+    def _systemd_lsp_command(self, env: Dict[str, str]) -> tuple[List[str], Dict[str, str]]:
+        try:
+            from tools.environments.local import _systemd_run_command, make_systemd_unit_name
+        except Exception:
+            return self._command, env
+
+        self._systemd_unit = make_systemd_unit_name("hermes-lsp")
+        wrapped = _systemd_run_command(
+            self._command,
+            env,
+            unit_name=self._systemd_unit,
+            memory_env_prefix="HERMES_LSP",
+            cwd=self._cwd,
+        )
+        client_env = {
+            "PATH": env.get("PATH", os.environ.get("PATH", "")),
+            "SYSTEMD_COLORS": "0",
+        }
+        return wrapped, client_env
+
+    async def _terminate_systemd_unit(self) -> None:
+        unit = self._systemd_unit
+        self._systemd_unit = ""
+        if not unit:
+            return
+        systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
+        for args in ([systemctl, "kill", "--kill-whom=all", unit], [systemctl, "stop", unit]):
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except Exception:
+                pass
+
     async def _spawn(self) -> None:
         env = dict(os.environ)
         if self._env:
             env.update(self._env)
 
+        command = list(self._command)
+        proc_env = env
+        if self._should_use_systemd_isolation():
+            command, proc_env = self._systemd_lsp_command(env)
+
         try:
             self._proc = await asyncio.create_subprocess_exec(
-                self._command[0],
-                *self._command[1:],
+                command[0],
+                *command[1:],
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=env,
+                env=proc_env,
                 cwd=self._cwd,
             )
         except FileNotFoundError as e:
+            try:
+                from tools.environments.local import _cleanup_systemd_env_files_from_command
+                _cleanup_systemd_env_files_from_command(command)
+            except Exception:
+                pass
+            self._systemd_unit = ""
             raise LSPProtocolError(
                 f"LSP server binary not found: {self._command[0]} ({e})"
             ) from e
+        except Exception:
+            try:
+                from tools.environments.local import _cleanup_systemd_env_files_from_command
+                _cleanup_systemd_env_files_from_command(command)
+            except Exception:
+                pass
+            self._systemd_unit = ""
+            raise
 
         # Drain stderr at debug level — if we don't, the pipe buffer
         # fills and the server hangs.
@@ -426,6 +492,7 @@ class LSPClient:
         proc = self._proc
         self._proc = None
         if proc is None:
+            await self._terminate_systemd_unit()
             return
         if proc.returncode is None:
             try:
@@ -440,6 +507,7 @@ class LSPClient:
                         pass
             except ProcessLookupError:
                 pass
+        await self._terminate_systemd_unit()
 
     # ------------------------------------------------------------------
     # request / notification plumbing
