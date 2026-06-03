@@ -41,21 +41,20 @@ def busy_input_hint_gateway(mode: str) -> str:
     if mode == "queue":
         return (
             "💡 First-time tip — I queued your message instead of interrupting. "
-            "Send `/busy interrupt` to make new messages stop the current task "
-            "immediately, or `/busy status` to check. This notice won't appear again."
+            "Send `/queue <message>` any time the session is cooking to queue "
+            "a follow-up for the next turn. This notice won't appear again."
         )
     if mode == "steer":
         return (
             "💡 First-time tip — I steered your message into the current run; "
             "it will arrive after the next tool call instead of interrupting. "
-            "Send `/busy interrupt` or `/busy queue` to change this, or "
-            "`/busy status` to check. This notice won't appear again."
+            "Use `/queue <message>` when you want a separate follow-up turn. "
+            "This notice won't appear again."
         )
     return (
         "💡 First-time tip — I just interrupted my current task to answer you. "
-        "Send `/busy queue` to queue follow-ups for after the current task instead, "
-        "`/busy steer` to inject them mid-run without interrupting, or "
-        "`/busy status` to check. This notice won't appear again."
+        "Send `/queue <message>` to queue a follow-up for after the current "
+        "task instead. This notice won't appear again."
     )
 
 

@@ -508,7 +508,7 @@ class TestBusySessionOnboardingHint:
 
     @pytest.mark.asyncio
     async def test_first_busy_ack_appends_interrupt_hint(self, tmp_path, monkeypatch):
-        """First busy-while-running message gets an extra hint about /busy."""
+        """First busy-while-running message gets an extra gateway-safe /queue hint."""
         import gateway.run as _gr
 
         monkeypatch.setattr(_gr, "_hermes_home", tmp_path)
@@ -542,7 +542,8 @@ class TestBusySessionOnboardingHint:
         assert "Interrupting" in content
         # First-touch hint appended
         assert "First-time tip" in content
-        assert "/busy queue" in content
+        assert "/queue <message>" in content
+        assert "/busy" not in content
 
         # The flag is now persisted to tmp_path/config.yaml
         import yaml
@@ -590,10 +591,11 @@ class TestBusySessionOnboardingHint:
         assert "Interrupting" in content
         assert "First-time tip" not in content
         assert "/busy queue" not in content
+        assert "/queue <message>" not in content
 
     @pytest.mark.asyncio
-    async def test_queue_mode_hint_points_to_interrupt(self, tmp_path, monkeypatch):
-        """In queue mode the hint should suggest /busy interrupt, not /busy queue."""
+    async def test_queue_mode_hint_points_to_queue_command(self, tmp_path, monkeypatch):
+        """In queue mode the gateway hint should still advertise the one-off /queue command."""
         import gateway.run as _gr
 
         monkeypatch.setattr(_gr, "_hermes_home", tmp_path)
@@ -616,6 +618,5 @@ class TestBusySessionOnboardingHint:
         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
         assert "Queued for the next turn" in content
         assert "First-time tip" in content
-        assert "/busy interrupt" in content
-        # Must NOT tell the user to /busy queue when they're already on queue.
-        assert "/busy queue" not in content
+        assert "/queue <message>" in content
+        assert "/busy" not in content

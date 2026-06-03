@@ -112,18 +112,20 @@ class TestMarkSeen:
 class TestHintMessages:
     def test_busy_input_hint_gateway_interrupt(self):
         msg = busy_input_hint_gateway("interrupt")
-        assert "/busy queue" in msg
+        assert "/queue <message>" in msg
+        assert "/busy" not in msg
         assert "interrupted" in msg.lower()
 
     def test_busy_input_hint_gateway_queue(self):
         msg = busy_input_hint_gateway("queue")
-        assert "/busy interrupt" in msg
+        assert "/queue <message>" in msg
+        assert "/busy" not in msg
         assert "queued" in msg.lower()
 
     def test_busy_input_hint_gateway_steer(self):
         msg = busy_input_hint_gateway("steer")
-        assert "/busy interrupt" in msg
-        assert "/busy queue" in msg
+        assert "/queue <message>" in msg
+        assert "/busy" not in msg
         assert "steer" in msg.lower()
 
     def test_busy_input_hint_cli_interrupt(self):
